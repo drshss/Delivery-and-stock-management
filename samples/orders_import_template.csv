@@ -1,0 +1,4 @@
+order_ref,customer_code,branch_code,cylinder_capacity_kg,quantity_ordered,notes
+A1,CUST001,,17,10,Morning drop
+A1,CUST001,,21,5,
+A2,CUST002,BR-002,33,2,Fragile - handle with care
