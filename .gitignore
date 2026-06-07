@@ -33,6 +33,7 @@ _smoke_test.db
 # Timestamped DB backups (e.g. delivery_app.db.bak-20260607-015003)
 *.db.bak-*
 *.bak
+*.db-*
 
 # ---- Uploads (user-generated content) ----
 uploads/
