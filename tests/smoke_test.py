@@ -1,22 +1,22 @@
 """End-to-end smoke test for the delivery & stock API.
 
-Runs the whole app in-process against a throwaway SQLite DB and uploads dir,
-exercising auth, RBAC, stock, customer/branch, delivery assignment, evidence
-upload, completion (with automatic stock update) and reporting.
+Runs the whole app in-process against a throwaway SQLite DB, exercising auth,
+RBAC, stock, customer/branch, delivery assignment, DB-backed evidence upload +
+download, completion (with automatic stock update) and reporting.
 
 Run with:  python -m tests.smoke_test
 """
 import os
-import shutil
 from datetime import date, timedelta
 
-# Point the app at throwaway resources BEFORE importing it.
+# Point the app at a throwaway database BEFORE importing it.
 os.environ["DATABASE_URL"] = "sqlite:///./_smoke_test.db"
-os.environ["UPLOAD_DIR"] = "_smoke_uploads"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
+from app.core.config import settings  # noqa: E402
+from app.manage import reset_admin_password  # noqa: E402
 
 
 def _auth(token: str) -> dict:
@@ -222,6 +222,19 @@ def run() -> None:
             files={"file": ("proofA.png", b"fake-image-bytes", "image/png")},
         )
         assert res.status_code == 201, res.text
+        ev = res.json()
+        # Evidence is stored in the DB and exposed via an authenticated download URL
+        # (no public file_path).
+        assert "file_path" not in ev, ev
+        assert ev["content_type"] == "image/png" and ev["size_bytes"] == len(b"fake-image-bytes"), ev
+        evidence_url = ev["download_url"]
+        assert evidence_url == f"/api/v1/orders/{order_a_id}/evidence/{ev['id']}", ev
+
+        # download returns the exact bytes, and requires authentication
+        res = client.get(evidence_url, headers=agent)
+        assert res.status_code == 200 and res.content == b"fake-image-bytes", res.status_code
+        assert res.headers["content-type"].startswith("image/png"), res.headers
+        assert client.get(evidence_url).status_code == 401, "evidence download must require auth"
 
         # a second evidence is allowed (max 2), but a third is rejected
         res = client.post(
@@ -358,9 +371,160 @@ def run() -> None:
         held = {c["customer_id"]: c["total_balance"] for c in res.json()}
         assert held.get(customer3_id) == 3 and held.get(customer_id) == 2, held
 
+        # ===== Q3: per-customer, per-date delivery breakdown =====
+        # C1 already has one completed delivery today (order A: 10 full / 8 empty).
+        # Add a second completed delivery for C1 on a later date to get a 2nd date row.
+        future = date.today() + timedelta(days=3)
+        res = client.post(
+            "/api/v1/deliveries",
+            headers=manager,
+            json={
+                "scheduled_date": str(future),
+                "vehicle_id": vehicle_id,
+                "delivery_agent_id": agent_id,
+                "orders": [
+                    {
+                        "customer_id": customer_id,
+                        "branch_id": branch_id,
+                        "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 7}],
+                    }
+                ],
+            },
+        )
+        assert res.status_code == 201, res.text
+        future_order_id = res.json()["orders"][0]["id"]
+        res = client.post(
+            f"/api/v1/orders/{future_order_id}/evidence",
+            headers=agent,
+            files={"file": ("future.png", b"img", "image/png")},
+        )
+        assert res.status_code == 201, res.text
+        res = client.post(
+            f"/api/v1/orders/{future_order_id}/complete",
+            headers=agent,
+            json={"items": [{"cylinder_type_id": cyl_id, "quantity_delivered": 7, "quantity_empty_collected": 6}]},
+        )
+        assert res.status_code == 200 and res.json()["status"] == "completed", res.text
+
+        # daily breakdown for C1 spanning both delivery dates
+        res = client.get(
+            "/api/v1/reports/customer-daily",
+            headers=admin,
+            params={
+                "customer_id": customer_id,
+                "start_date": str(date.today()),
+                "end_date": str(future),
+            },
+        )
+        assert res.status_code == 200, res.text
+        daily = res.json()
+        assert daily["customer_id"] == customer_id, daily
+        assert daily["total_full_delivered"] == 17, daily       # 10 + 7
+        assert daily["total_empty_collected"] == 14, daily      # 8 + 6
+        days = {d["delivery_date"]: d for d in daily["days"]}
+        assert len(days) == 2, daily
+        assert days[str(date.today())]["total_full_delivered"] == 10, daily
+        assert days[str(date.today())]["total_empty_collected"] == 8, daily
+        assert days[str(future)]["total_full_delivered"] == 7, daily
+        assert days[str(future)]["total_empty_collected"] == 6, daily
+
+        # a narrower range returns only the matching day
+        res = client.get(
+            "/api/v1/reports/customer-daily",
+            headers=admin,
+            params={
+                "customer_id": customer_id,
+                "start_date": str(future),
+                "end_date": str(future),
+            },
+        )
+        assert res.status_code == 200, res.text
+        narrow = res.json()
+        assert len(narrow["days"]) == 1, narrow
+        assert narrow["total_full_delivered"] == 7, narrow
+
+        # unknown customer -> 404
+        res = client.get(
+            "/api/v1/reports/customer-daily",
+            headers=admin,
+            params={"customer_id": 999999, "start_date": str(date.today()), "end_date": str(future)},
+        )
+        assert res.status_code == 404, res.text
+
         # ---- RBAC: agent cannot onboard customers ----
         res = client.post("/api/v1/customers", headers=agent, json={"code": "X", "name": "Nope"})
         assert res.status_code == 403, "delivery agent must not be allowed to create customers"
+
+        # ===== Q4: refresh tokens + logout (revocation) =====
+        res = client.post(
+            "/api/v1/auth/login",
+            data={"username": "smoke_mgr@a.com", "password": "manager123"},
+        )
+        assert res.status_code == 200, res.text
+        tokens = res.json()
+        assert tokens.get("access_token") and tokens.get("refresh_token"), tokens
+        acc, ref = tokens["access_token"], tokens["refresh_token"]
+
+        # access token authenticates
+        assert client.get("/api/v1/auth/me", headers=_auth(acc)).status_code == 200
+
+        # refresh -> brand new access token that also works
+        res = client.post("/api/v1/auth/refresh", json={"refresh_token": ref})
+        assert res.status_code == 200, res.text
+        new_acc = res.json()["access_token"]
+        assert client.get("/api/v1/auth/me", headers=_auth(new_acc)).status_code == 200
+
+        # token types are not interchangeable
+        assert client.get("/api/v1/auth/me", headers=_auth(ref)).status_code == 401, \
+            "a refresh token must not authenticate as an access token"
+        assert client.post("/api/v1/auth/refresh", json={"refresh_token": acc}).status_code == 401, \
+            "an access token must not be accepted at /refresh"
+
+        # logout revokes EVERY token for the user
+        assert client.post("/api/v1/auth/logout", headers=_auth(new_acc)).status_code == 204
+        assert client.get("/api/v1/auth/me", headers=_auth(acc)).status_code == 401, \
+            "old access token must be revoked after logout"
+        assert client.get("/api/v1/auth/me", headers=_auth(new_acc)).status_code == 401, \
+            "refreshed access token must be revoked after logout"
+        assert client.post("/api/v1/auth/refresh", json={"refresh_token": ref}).status_code == 401, \
+            "refresh token must be revoked after logout"
+
+        # ===== Break-glass admin recovery (python -m app.manage reset-admin-password) =====
+        # An existing admin session must die after a reset, the old password must
+        # stop working, and the new one must work.
+        old_admin_token = _login(client, "admin@delivery.com", "admin123")
+        assert client.get("/api/v1/auth/me", headers=_auth(old_admin_token)).status_code == 200
+
+        reset_admin_password(email="admin@delivery.com", password="NewBreakGlassPass!1")
+
+        assert client.get("/api/v1/auth/me", headers=_auth(old_admin_token)).status_code == 401, \
+            "existing admin sessions must be revoked after a password reset"
+        res = client.post(
+            "/api/v1/auth/login",
+            data={"username": "admin@delivery.com", "password": "admin123"},
+        )
+        assert res.status_code == 401, "old admin password must stop working after a reset"
+        assert _login(client, "admin@delivery.com", "NewBreakGlassPass!1"), \
+            "admin must be able to log in with the reset password"
+
+        # Restore the original admin password so later steps see a clean state.
+        # The trailing successful login also clears the rate-limit counter before Q5.
+        reset_admin_password(email="admin@delivery.com", password="admin123")
+        assert _login(client, "admin@delivery.com", "admin123")
+
+        # ===== Q5: login brute-force rate limiting (run LAST — it blocks the IP) =====
+        for _ in range(settings.LOGIN_MAX_FAILED_ATTEMPTS):
+            r = client.post(
+                "/api/v1/auth/login",
+                data={"username": "admin@delivery.com", "password": "wrong-password"},
+            )
+            assert r.status_code == 401, r.text
+        # Next attempt is blocked even though it's still a bad password.
+        r = client.post(
+            "/api/v1/auth/login",
+            data={"username": "admin@delivery.com", "password": "wrong-password"},
+        )
+        assert r.status_code == 429, f"expected rate-limit 429, got {r.status_code}"
 
     print("ALL SMOKE TESTS PASSED \u2705")
 
@@ -368,8 +532,6 @@ def run() -> None:
 def _cleanup() -> None:
     if os.path.exists("_smoke_test.db"):
         os.remove("_smoke_test.db")
-    if os.path.isdir("_smoke_uploads"):
-        shutil.rmtree("_smoke_uploads", ignore_errors=True)
 
 
 if __name__ == "__main__":

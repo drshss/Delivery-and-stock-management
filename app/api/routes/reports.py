@@ -6,7 +6,7 @@ Order -> Delivery to filter by date.
 """
 from datetime import date
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session, selectinload
 
@@ -19,7 +19,12 @@ from app.models.enums import DeliveryStatus
 from app.models.user import User
 from app.schemas.customer import CustomerCylinderBalance, CustomerCylinderBalanceItem
 from app.schemas.delivery import OrderOut
-from app.schemas.report import CustomerDeliveryReport, DateRangeReport
+from app.schemas.report import (
+    CustomerDailyDeliveryItem,
+    CustomerDailyDeliveryReport,
+    CustomerDeliveryReport,
+    DateRangeReport,
+)
 
 router = APIRouter()
 
@@ -73,9 +78,10 @@ def date_range_report(
 @router.get(
     "/by-customer",
     response_model=list[CustomerDeliveryReport],
-    summary="Per-customer order report (optional date range)",
+    summary="Per-customer order report (optional date range / single customer)",
 )
 def by_customer_report(
+    customer_id: int | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     db: Session = Depends(get_db),
@@ -106,6 +112,9 @@ def by_customer_report(
         .join(Delivery, Order.delivery_id == Delivery.id)
     )
 
+    if customer_id:
+        order_query = order_query.filter(Customer.id == customer_id)
+        item_query = item_query.filter(Order.customer_id == customer_id)
     if start_date:
         order_query = order_query.filter(Delivery.scheduled_date >= start_date)
         item_query = item_query.filter(Delivery.scheduled_date >= start_date)
@@ -134,6 +143,73 @@ def by_customer_report(
             )
         )
     return results
+
+
+@router.get(
+    "/customer-daily",
+    response_model=CustomerDailyDeliveryReport,
+    summary="Per-date cylinders delivered/collected for one customer over a date range",
+)
+def customer_daily_report(
+    customer_id: int = Query(...),
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin_or_manager),
+):
+    """Daily statement for a single customer: one row per delivery date with the
+    full cylinders delivered and empties collected, plus the range grand total.
+
+    Only COMPLETED orders contribute. Dates come from the parent run's
+    scheduled_date (a date with no completed deliveries simply does not appear).
+    """
+    customer = db.get(Customer, customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    rows = (
+        db.query(
+            Delivery.scheduled_date.label("delivery_date"),
+            func.coalesce(func.sum(OrderItem.quantity_delivered), 0).label("full"),
+            func.coalesce(func.sum(OrderItem.quantity_empty_collected), 0).label("empty"),
+        )
+        .join(Order, OrderItem.order_id == Order.id)
+        .join(Delivery, Order.delivery_id == Delivery.id)
+        .filter(
+            Order.customer_id == customer_id,
+            Order.status == DeliveryStatus.COMPLETED,
+            Delivery.scheduled_date >= start_date,
+            Delivery.scheduled_date <= end_date,
+        )
+        .group_by(Delivery.scheduled_date)
+        .order_by(Delivery.scheduled_date)
+        .all()
+    )
+
+    days: list[CustomerDailyDeliveryItem] = []
+    total_full = 0
+    total_empty = 0
+    for row in rows:
+        full, empty = int(row.full), int(row.empty)
+        total_full += full
+        total_empty += empty
+        days.append(
+            CustomerDailyDeliveryItem(
+                delivery_date=row.delivery_date,
+                total_full_delivered=full,
+                total_empty_collected=empty,
+            )
+        )
+
+    return CustomerDailyDeliveryReport(
+        customer_id=customer_id,
+        customer_name=customer.name,
+        start_date=start_date,
+        end_date=end_date,
+        total_full_delivered=total_full,
+        total_empty_collected=total_empty,
+        days=days,
+    )
 
 
 @router.get(

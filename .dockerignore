@@ -1,0 +1,39 @@
+# Keep the build context small and never ship secrets/data into the image.
+.git
+.gitignore
+.venv
+venv
+env
+
+# Secrets & local config
+.env
+.env.*
+!.env.example
+creds
+*.pem
+*.key
+
+# Local databases & uploads (must not be baked into images)
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+_smoke_uploads/
+
+# Dev / diagnostic artifacts
+_diag*.py
+delivery.json
+
+# Caches & tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

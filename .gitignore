@@ -1,0 +1,56 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+creds
+*.pem
+*.key
+secrets.*
+
+# ---- Databases (local/dev only; never commit data) ----
+*.db
+*.sqlite
+*.sqlite3
+delivery_app.db
+_smoke_test.db
+# Timestamped DB backups (e.g. delivery_app.db.bak-20260607-015003)
+*.db.bak-*
+*.bak
+
+# ---- Uploads (user-generated content) ----
+uploads/
+_smoke_uploads/
+
+# ---- Misc dev artifacts ----
+delivery.json
+_diag*.py
+
+# ---- Test / coverage ----
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+*.swp

@@ -1,0 +1,26 @@
+# API service using an EXTERNAL PostgreSQL database (managed RDS / Supabase /
+# Neon / Cloud SQL / a DB on another host). No Postgres container is run here.
+#
+# Setup:
+#   1. cp .env.example .env  and set DATABASE_URL to your external Postgres
+#      (include ?sslmode=require for managed providers).
+#   2. docker compose up --build -d
+#
+# Multi-replica deploys: set RUN_MIGRATIONS=0 in .env and run migrations once
+# before rolling out:  docker compose run --rm api alembic upgrade head
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_URL: ${DATABASE_URL}          # full external connection string
+      BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS}
+      FIRST_ADMIN_EMAIL: ${FIRST_ADMIN_EMAIL}
+      FIRST_ADMIN_PASSWORD: ${FIRST_ADMIN_PASSWORD}
+      FIRST_ADMIN_NAME: ${FIRST_ADMIN_NAME:-System Admin}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-1}
+    ports:
+      - "8000:8000"

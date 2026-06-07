@@ -1,7 +1,8 @@
 from datetime import date, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
+from app.core.config import settings
 from app.models.enums import DeliveryStatus
 
 
@@ -32,8 +33,18 @@ class OrderEvidenceOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    file_path: str
+    order_id: int
+    filename: str | None = None
+    content_type: str
+    size_bytes: int
+    uploaded_by: int | None = None
     uploaded_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def download_url(self) -> str:
+        """Authenticated endpoint to fetch the image bytes."""
+        return f"{settings.API_V1_PREFIX}/orders/{self.order_id}/evidence/{self.id}"
 
 
 # ----- orders -----
@@ -49,6 +60,9 @@ class OrderCreate(BaseModel):
 class OrderComplete(BaseModel):
     items: list[OrderItemComplete] = Field(min_length=1)
     notes: str | None = None
+    # Admin-only: justification for completing the order when no photo evidence
+    # was uploaded. Ignored for non-admins (who must always provide evidence).
+    evidence_override_reason: str | None = Field(default=None, max_length=1000)
 
 
 class OrderMove(BaseModel):
@@ -69,6 +83,9 @@ class OrderOut(BaseModel):
     status: DeliveryStatus
     completed_at: datetime | None = None
     notes: str | None = None
+    evidence_override_reason: str | None = None
+    evidence_overridden_by: int | None = None
+    evidence_overridden_at: datetime | None = None
     created_at: datetime
     items: list[OrderItemOut] = []
     evidences: list[OrderEvidenceOut] = []

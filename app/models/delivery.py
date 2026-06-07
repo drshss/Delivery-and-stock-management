@@ -9,7 +9,7 @@ A delivery's status is an aggregate derived from the status of its orders.
 """
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Date, DateTime, Enum, ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -75,6 +75,10 @@ class Order(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Audit trail for an admin completing an order without the mandatory photo evidence.
+    evidence_override_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_overridden_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    evidence_overridden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -83,6 +87,7 @@ class Order(Base):
     delivery = relationship("Delivery", back_populates="orders", foreign_keys=[delivery_id])
     customer = relationship("Customer", back_populates="orders")
     branch = relationship("CustomerBranch")
+    evidence_overrider = relationship("User", foreign_keys=[evidence_overridden_by])
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
     evidences = relationship("OrderEvidence", back_populates="order", cascade="all, delete-orphan")
     move_history = relationship(
@@ -107,13 +112,21 @@ class OrderItem(Base):
 
 
 class OrderEvidence(Base):
-    """Photo evidence uploaded by the delivery agent as proof of delivery for an order."""
+    """Photo evidence uploaded by the delivery agent as proof of delivery for an order.
+
+    The image bytes are stored directly in the database (BYTEA on PostgreSQL,
+    BLOB on SQLite) and served only through an authenticated download endpoint —
+    no files are written to local/ephemeral disk.
+    """
 
     __tablename__ = "order_evidences"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False, index=True)
-    file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     uploaded_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

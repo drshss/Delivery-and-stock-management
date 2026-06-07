@@ -19,7 +19,7 @@ mapping, customer self-service requests and payments.
 
 ## Tech stack
 
-FastAPI · SQLAlchemy 2.0 · Pydantic v2 · JWT (python-jose) · passlib/bcrypt · SQLite (dev) / PostgreSQL (prod).
+FastAPI · SQLAlchemy 2.0 · Alembic (migrations) · Pydantic v2 · JWT (python-jose) · bcrypt · SQLite (dev) / PostgreSQL (prod) · Docker.
 
 ## Project structure
 
@@ -32,9 +32,15 @@ app/
   api/
     deps.py    auth & role dependencies
     routes/    auth, users, customers, cylinders, stock, vehicles, deliveries, orders, reports
-  main.py      FastAPI app (startup creates tables + bootstrap admin)
+  main.py      FastAPI app (dev: auto-creates tables; prod: Alembic-managed)
+alembic/       database migrations (env.py + versions/)
+alembic.ini    Alembic config (DB URL injected from app settings)
+Dockerfile           container image (runs migrations, then Uvicorn)
+docker-compose.yml   local prod-like stack: PostgreSQL + API
+.env.example   environment template — copy to .env
 seed.py        sample data for development
 ```
+
 
 ### Data model
 
@@ -92,7 +98,9 @@ values in `.env` (default `admin@delivery.com` / `admin123`).
 
 | Method & path                              | Role            | Purpose                              |
 |--------------------------------------------|-----------------|--------------------------------------|
-| `POST /api/v1/auth/login`                  | public          | Get JWT token (username = email)     |
+| `POST /api/v1/auth/login`                  | public          | Login → access + refresh tokens (rate-limited) |
+| `POST /api/v1/auth/refresh`                 | public          | Exchange a refresh token for a new access token |
+| `POST /api/v1/auth/logout`                  | any             | Revoke all of the current user's tokens |
 | `GET  /api/v1/auth/me`                      | any             | Current user                         |
 | `POST /api/v1/users`                        | admin           | Create user                          |
 | `GET  /api/v1/users/delivery-agents`        | admin/manager   | List agents for assignment           |
@@ -109,17 +117,170 @@ values in `.env` (default `admin@delivery.com` / `admin123`).
 | `POST /api/v1/deliveries/{id}/assign`       | admin/manager   | Assign / re-assign vehicle+agent+date|
 | `GET  /api/v1/deliveries`                   | any (scoped)    | List runs; filter status/vehicle/agent/customer/date |
 | `GET  /api/v1/orders`                       | any (scoped)    | List orders; filter status/customer/branch/vehicle/agent/date |
-| `POST /api/v1/orders/{id}/evidence`         | agent/admin     | Upload proof photo for an order      |
+| `POST /api/v1/orders/{id}/evidence`         | agent/admin     | Upload proof photo (stored in DB)    |
+| `GET  /api/v1/orders/{id}/evidence/{evidence_id}` | any (scoped) | Download a proof photo (authenticated) |
 | `POST /api/v1/orders/{id}/complete`         | agent/admin     | Submit counts, complete, update stock|
 | `POST /api/v1/orders/{id}/move`             | admin/manager   | Move an order to another run         |
 | `GET  /api/v1/reports/date-range`           | admin/manager   | Date-wise report                     |
 | `GET  /api/v1/reports/by-customer`          | admin/manager   | Customer-wise report                 |
 | `GET  /api/v1/reports/pending-orders`       | admin/manager   | Incomplete orders to re-schedule     |
 
+## Production deployment (external PostgreSQL)
+
+In production the schema is managed by **Alembic migrations** (not auto-created),
+secrets are **required**, and the app runs under multiple Uvicorn workers. The app
+connects to an **external** PostgreSQL (managed RDS / Supabase / Neon / Cloud SQL,
+or a DB on another host) — only `DATABASE_URL` changes, no code changes needed.
+
+### Option A — Docker Compose (API only, external DB)
+
+```bash
+# 1. Create a .env from the template and fill in REAL values
+cp .env.example .env
+#    generate a strong secret:
+python -c "import secrets; print(secrets.token_urlsafe(64))"
+#    set DATABASE_URL to your external Postgres, e.g.
+#    postgresql+psycopg://user:pass@db-host:5432/gas_delivery?sslmode=require
+
+# 2. Build & start the API. It runs `alembic upgrade head` automatically
+#    against the external DB before serving (see RUN_MIGRATIONS below).
+docker compose up --build -d
+
+# 3. Check health
+curl http://localhost:8000/health
+```
+
+The `docker-compose.yml` runs **only the API container** and reads `DATABASE_URL`
+straight from `.env`. Ensure the DB host is reachable from the container and that
+your provider's firewall allowlists the server's egress IP.
+
+### Option B — Manual / VM
+
+```bash
+pip install -r requirements.txt
+
+export ENVIRONMENT=production
+export SECRET_KEY="<64-char random string>"
+export DATABASE_URL="postgresql+psycopg://user:pass@db-host:5432/gas_delivery?sslmode=require"
+export BACKEND_CORS_ORIGINS="https://app.example.com,https://admin.example.com"
+export FIRST_ADMIN_PASSWORD="<strong password>"
+
+# Apply migrations, then serve
+alembic upgrade head
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 --proxy-headers
+```
+
+### Database migrations (Alembic)
+
+```bash
+alembic upgrade head                          # apply all migrations
+alembic revision --autogenerate -m "message"  # create a migration after model changes
+alembic downgrade -1                           # roll back one migration
+```
+
+> ⚠️ After **any** change to `app/models/`, generate a new migration and commit it.
+
+**Multiple replicas:** by default each container runs migrations on startup
+(`RUN_MIGRATIONS=1`). If you run more than one API replica against the same
+external DB, set `RUN_MIGRATIONS=0` and apply migrations once as a one-off step
+before rolling out, so replicas don't race:
+
+```bash
+docker compose run --rm api alembic upgrade head
+```
+
+### Connecting to external PostgreSQL
+
+- **TLS:** append `?sslmode=require` to `DATABASE_URL` (most managed providers
+  require it); use `verify-full` with a CA cert for stricter setups.
+- **Password encoding:** URL-encode special characters (`@` → `%40`, `:` → `%3A`).
+- **Connection pooling:** serverless Postgres (Supabase, Neon) expose a separate
+  pooled endpoint (e.g. Supabase port `6543`, pgbouncer transaction mode). If you
+  use it, keep `DB_POOL_SIZE` modest.
+
+
+## ✅ Before you deploy — checklist
+
+These are the changes/decisions to make before going live:
+
+1. **Secrets (required in production)** — set in `.env` / your secret manager:
+   - `ENVIRONMENT=production` (this **enforces** the checks below at startup).
+   - `SECRET_KEY` — strong 64-char random value (`secrets.token_urlsafe(64)`).
+   - `FIRST_ADMIN_PASSWORD` — strong; **change the bootstrap admin password** after first login.
+   The app refuses to start in production if these are weak/default — see
+   [`app/core/config.py`](app/core/config.py) `_enforce_production_safety`.
+
+2. **Database (external PostgreSQL)** — set `DATABASE_URL`
+   (`postgresql+psycopg://…?sslmode=require`). Ensure the DB host is reachable
+   from the app and **allowlist the server's egress IP** in the provider's
+   firewall / security group. Tune `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` for your
+   load. Run `alembic upgrade head` on every deploy (or once for multi-replica —
+   see `RUN_MIGRATIONS`).
+
+3. **CORS** — set `BACKEND_CORS_ORIGINS` to your **explicit** web/app origins
+   (comma-separated). Wildcard `*` is rejected in production.
+
+4. **Rotate leaked credentials** — the old `creds` file and `delivery_app.db`
+   were untracked from git; **rotate any passwords** that were committed previously.
+
+5. **Delivery evidence storage** — proof-of-delivery photos are stored **in the
+   database** (`order_evidences.data`) and served only via the authenticated
+   endpoint `GET /orders/{id}/evidence/{evidence_id}`; nothing is written to
+   local/ephemeral disk and there is no public `/uploads` path. For very high
+   media volumes you may later externalise this to object storage (S3/GCS) with
+   signed URLs, but it is not required to go live.
+
+6. **TLS & reverse proxy** — terminate HTTPS at a proxy (nginx / cloud LB) in
+   front of the app; the server already honours `--proxy-headers`.
+
+7. **Backups & monitoring** — most managed Postgres providers handle automated
+   backups (confirm it's enabled and set retention); otherwise schedule your own.
+   Wire up the `/health` endpoint to your uptime/monitoring checks.
+
+
+8. **Do not seed prod** — `seed.py` and the dev seed users are for development only.
+
+## Security & observability
+
+- **Structured logging** — logs go to **stdout** so Cloud Run / Azure App Service /
+  AWS / a plain VM capture them automatically. In production each line is **JSON**
+  (with a GCP-friendly `severity` field and a per-request `request_id`); in dev it's
+  human-readable. Configure via `LOG_LEVEL` / `LOG_FORMAT`. See
+  [`app/core/logging_config.py`](app/core/logging_config.py).
+- **Request correlation** — every request gets an `X-Request-ID` (honouring an
+  inbound `X-Request-ID` / `X-Cloud-Trace-Context`), logged with method, path,
+  status and duration.
+- **Optional error tracking** — set `SENTRY_DSN` (and `pip install sentry-sdk`) to
+  enable Sentry; otherwise it's completely inert.
+- **Login brute-force protection** — failed logins are rate-limited per client IP
+  (`LOGIN_MAX_FAILED_ATTEMPTS` / `LOGIN_ATTEMPT_WINDOW_SECONDS`), returning **429**
+  once exceeded. In-memory by default; back it with Redis for exact cluster-wide
+  limits. See [`app/core/rate_limit.py`](app/core/rate_limit.py).
+- **Token revocation & refresh** — login issues a short-lived **access token** plus
+  a longer-lived **refresh token** (`/auth/refresh`). Each token carries the user's
+  `token_version`; `/auth/logout` (and any password change) bumps it, instantly
+  revoking all outstanding tokens for that user.
+- **Admin account recovery (break-glass)** — locked out of the admin account? Run a
+  one-off command **inside a container** (no email/SMTP needed). It resets the
+  password, reactivates the account and revokes all of its sessions:
+  ```bash
+  # Provide the new password out-of-band so it stays out of shell history.
+  # Docker / Compose:
+  docker compose run --rm -e RESET_ADMIN_PASSWORD='new-strong-password' \
+      api python -m app.manage reset-admin-password --email admin@yourcompany.com
+  # Kubernetes:
+  kubectl exec deploy/api -- env RESET_ADMIN_PASSWORD='new-strong-password' \
+      python -m app.manage reset-admin-password --email admin@yourcompany.com
+  # Cloud Run Jobs / ECS run-task: set the container command to the same line.
+  ```
+  Nothing runs automatically on restart, so there's no risk of silently
+  re-resetting the password. See [`app/manage.py`](app/manage.py).
+
 ## Scaling notes (future-ready)
 
-- Switch `DATABASE_URL` to PostgreSQL (`postgresql+psycopg://…`) — no code changes needed.
 - Branch `latitude`/`longitude` are stored already, ready for automatic route mapping.
 - Stateless JWT auth scales horizontally behind a load balancer.
+- Stock completion row-locks the stock record (`SELECT … FOR UPDATE`) so
+  concurrent deliveries can't corrupt counts on PostgreSQL.
 - The status state-machine and assignment history support customer-request and payment modules later.
-- Move evidence uploads to object storage (S3/GCS) and serve via signed URLs in production.
+

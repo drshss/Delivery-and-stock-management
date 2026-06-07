@@ -1,9 +1,7 @@
 """Order workflow: list/filter, detail, evidence upload, completion (stock update), cancel, move."""
-import os
-import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_user, require_admin_or_manager
@@ -126,21 +124,19 @@ def upload_order_evidence(
     if file.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(status_code=400, detail="Only JPEG, PNG or WEBP images are allowed")
 
-    folder = os.path.join(settings.UPLOAD_DIR, "orders", str(order.id))
-    os.makedirs(folder, exist_ok=True)
-    ext = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
-    filepath = os.path.join(folder, f"{uuid.uuid4().hex}{ext}")
-
     contents = file.file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
     if len(contents) > max_bytes:
         raise HTTPException(status_code=400, detail=f"File exceeds {settings.MAX_UPLOAD_SIZE_MB} MB limit")
-    with open(filepath, "wb") as out:
-        out.write(contents)
 
     evidence = OrderEvidence(
         order_id=order.id,
-        file_path=filepath.replace("\\", "/"),
+        filename=file.filename,
+        content_type=file.content_type,
+        size_bytes=len(contents),
+        data=contents,
         uploaded_by=current_user.id,
     )
     # First evidence marks the order (and its run) as in transit.
@@ -151,6 +147,32 @@ def upload_order_evidence(
     db.commit()
     db.refresh(evidence)
     return evidence
+
+
+@router.get(
+    "/{order_id}/evidence/{evidence_id}",
+    summary="Download a proof-of-delivery photo (authenticated, RBAC-scoped)",
+)
+def download_order_evidence(
+    order_id: int,
+    evidence_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Stream the stored image bytes. Delivery agents may only access evidence on
+    their own runs; admins and stock managers may access any."""
+    order = _get_order_or_404(db, order_id)
+    _assert_agent_owns(order, current_user)
+    evidence = db.get(OrderEvidence, evidence_id)
+    if not evidence or evidence.order_id != order.id:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    safe_name = (evidence.filename or f"evidence-{evidence.id}").replace('"', "")
+    return Response(
+        content=evidence.data,
+        media_type=evidence.content_type,
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
 
 
 # ----------------------------- Complete (per order) -----------------------------
@@ -174,12 +196,27 @@ def complete_order(
     if order.status == DeliveryStatus.CANCELLED:
         raise HTTPException(status_code=400, detail="Order is cancelled")
 
-    # Business rule: a delivery agent must capture photo evidence before submitting.
-    if current_user.role == UserRole.DELIVERY_AGENT and not order.evidences:
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload delivery evidence (photo) before completing the order",
-        )
+    # Business rule: proof-of-delivery photo evidence is mandatory before an order
+    # can be completed. The one exception is an admin who explicitly justifies the
+    # missing evidence with a written comment — recorded below as an audit trail.
+    if not order.evidences:
+        override_reason = (payload.evidence_override_reason or "").strip()
+        if current_user.role != UserRole.ADMIN:
+            raise HTTPException(
+                status_code=400,
+                detail="Please upload delivery evidence (photo) before completing the order",
+            )
+        if not override_reason:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Delivery evidence is missing. As an admin you may complete this order "
+                    "by providing 'evidence_override_reason' explaining why."
+                ),
+            )
+        order.evidence_override_reason = override_reason
+        order.evidence_overridden_by = current_user.id
+        order.evidence_overridden_at = datetime.now(timezone.utc)
 
     items_by_type = {item.cylinder_type_id: item for item in order.items}
     for completed in payload.items:
@@ -192,7 +229,14 @@ def complete_order(
         item.quantity_delivered = completed.quantity_delivered
         item.quantity_empty_collected = completed.quantity_empty_collected
 
-        stock = db.query(Stock).filter(Stock.cylinder_type_id == completed.cylinder_type_id).first()
+        # Row-lock the stock record so concurrent completions can't corrupt counts
+        # (FOR UPDATE on PostgreSQL; ignored harmlessly on SQLite).
+        stock = (
+            db.query(Stock)
+            .filter(Stock.cylinder_type_id == completed.cylinder_type_id)
+            .with_for_update()
+            .first()
+        )
         if not stock:
             stock = Stock(cylinder_type_id=completed.cylinder_type_id, full_quantity=0, empty_quantity=0)
             db.add(stock)

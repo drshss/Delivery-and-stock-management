@@ -23,6 +23,11 @@ class User(Base):
         default=UserRole.DELIVERY_AGENT,
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Bumped to revoke all existing access/refresh tokens for this user
+    # (e.g. on logout-all or password change). Tokens carry this value as "ver".
+    token_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     assigned_deliveries = relationship(

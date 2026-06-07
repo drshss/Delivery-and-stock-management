@@ -87,6 +87,8 @@ def update_user(
     data = payload.model_dump(exclude_unset=True)
     if data.get("password"):
         user.hashed_password = hash_password(data.pop("password"))
+        # Revoke existing tokens when the password changes.
+        user.token_version += 1
     else:
         data.pop("password", None)
     for key, value in data.items():
