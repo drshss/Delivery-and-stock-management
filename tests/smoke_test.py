@@ -29,6 +29,20 @@ def _login(client: TestClient, email: str, password: str) -> str:
     return res.json()["access_token"]
 
 
+def _create_orders(client: TestClient, headers: dict, specs: list[dict]) -> list[int]:
+    """Order-first helper: create standalone (pending) orders, return their ids.
+
+    Mirrors how the app works now — orders are created first, then attached to a
+    delivery run via the run's `order_ids` (or `POST /orders/{id}/assign`).
+    """
+    ids: list[int] = []
+    for spec in specs:
+        res = client.post("/api/v1/orders", headers=headers, json=spec)
+        assert res.status_code == 201, res.text
+        ids.append(res.json()["id"])
+    return ids
+
+
 def run() -> None:
     with TestClient(app) as client:
         # ---- health ----
@@ -131,22 +145,28 @@ def run() -> None:
         assert res.status_code == 403, "manager must not be able to set stock"
 
         # ---- create a delivery run with TWO customer orders (manager allocates) ----
+        # Order-first: create the orders, then attach them to the run by id.
+        order_ids = _create_orders(
+            client,
+            manager,
+            [
+                {
+                    "customer_id": customer_id,
+                    "branch_id": branch_id,
+                    "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 10}],
+                },
+                {
+                    "customer_id": customer2_id,
+                    "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 4}],
+                },
+            ],
+        )
         res = client.post(
             "/api/v1/deliveries",
             headers=manager,
             json={
                 "scheduled_date": str(date.today()),
-                "orders": [
-                    {
-                        "customer_id": customer_id,
-                        "branch_id": branch_id,
-                        "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 10}],
-                    },
-                    {
-                        "customer_id": customer2_id,
-                        "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 4}],
-                    },
-                ],
+                "order_ids": order_ids,
             },
         )
         assert res.status_code == 201, res.text
@@ -167,6 +187,16 @@ def run() -> None:
         assert res.status_code == 200 and res.json()["status"] == "assigned", res.text
 
         # ---- a second run (tomorrow) to move an order into ----
+        order_c_ids = _create_orders(
+            client,
+            manager,
+            [
+                {
+                    "customer_id": customer3_id,
+                    "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 1}],
+                }
+            ],
+        )
         res = client.post(
             "/api/v1/deliveries",
             headers=manager,
@@ -174,12 +204,7 @@ def run() -> None:
                 "scheduled_date": str(date.today() + timedelta(days=1)),
                 "vehicle_id": vehicle_id,
                 "delivery_agent_id": agent_id,
-                "orders": [
-                    {
-                        "customer_id": customer3_id,
-                        "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 1}],
-                    }
-                ],
+                "order_ids": order_c_ids,
             },
         )
         assert res.status_code == 201, res.text
@@ -308,6 +333,19 @@ def run() -> None:
         assert res.status_code == 200, res.text
 
         # one delivery -> one order -> TWO cylinder types (17kg + 21kg)
+        multi_order_ids = _create_orders(
+            client,
+            manager,
+            [
+                {
+                    "customer_id": customer3_id,
+                    "items": [
+                        {"cylinder_type_id": cyl_id, "quantity_ordered": 6},
+                        {"cylinder_type_id": cyl21_id, "quantity_ordered": 4},
+                    ],
+                }
+            ],
+        )
         res = client.post(
             "/api/v1/deliveries",
             headers=manager,
@@ -315,15 +353,7 @@ def run() -> None:
                 "scheduled_date": str(date.today()),
                 "vehicle_id": vehicle_id,
                 "delivery_agent_id": agent_id,
-                "orders": [
-                    {
-                        "customer_id": customer3_id,
-                        "items": [
-                            {"cylinder_type_id": cyl_id, "quantity_ordered": 6},
-                            {"cylinder_type_id": cyl21_id, "quantity_ordered": 4},
-                        ],
-                    }
-                ],
+                "order_ids": multi_order_ids,
             },
         )
         assert res.status_code == 201, res.text
@@ -375,6 +405,17 @@ def run() -> None:
         # C1 already has one completed delivery today (order A: 10 full / 8 empty).
         # Add a second completed delivery for C1 on a later date to get a 2nd date row.
         future = date.today() + timedelta(days=3)
+        future_order_ids = _create_orders(
+            client,
+            manager,
+            [
+                {
+                    "customer_id": customer_id,
+                    "branch_id": branch_id,
+                    "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 7}],
+                }
+            ],
+        )
         res = client.post(
             "/api/v1/deliveries",
             headers=manager,
@@ -382,13 +423,7 @@ def run() -> None:
                 "scheduled_date": str(future),
                 "vehicle_id": vehicle_id,
                 "delivery_agent_id": agent_id,
-                "orders": [
-                    {
-                        "customer_id": customer_id,
-                        "branch_id": branch_id,
-                        "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 7}],
-                    }
-                ],
+                "order_ids": future_order_ids,
             },
         )
         assert res.status_code == 201, res.text

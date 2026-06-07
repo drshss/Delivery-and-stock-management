@@ -6,13 +6,15 @@
 #      (include ?sslmode=require for managed providers).
 #   2. docker compose up --build -d
 #
-# Multi-replica deploys: set RUN_MIGRATIONS=0 in .env and run migrations once
-# before rolling out:  docker compose run --rm api alembic upgrade head
+# Multi-replica / zero-downtime deploys (recommended):
+#   1. Set RUN_MIGRATIONS=0 in .env so app replicas never race on migrations.
+#   2. Apply migrations ONCE before rolling out:  docker compose run --rm migrate
+#   3. Deploy/scale the app:  docker compose up -d --build
 services:
   api:
     build: .
     restart: unless-stopped
-    environment:
+    environment: &app_environment
       ENVIRONMENT: ${ENVIRONMENT:-production}
       SECRET_KEY: ${SECRET_KEY}
       DATABASE_URL: ${DATABASE_URL}          # full external connection string
@@ -24,3 +26,19 @@ services:
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-1}
     ports:
       - "8000:8000"
+
+  # One-off database migration runner. Applies `alembic upgrade head` then exits.
+  # It is NOT started by `docker compose up` (it sits behind the "tools" profile),
+  # so it never races the API replicas. Run it explicitly before a rollout:
+  #   docker compose run --rm migrate
+  # Reuses the API image and the exact same environment (the production-safety
+  # checks in config.py require SECRET_KEY/DATABASE_URL/etc. even just to migrate).
+  migrate:
+    build: .
+    profiles: ["tools"]
+    restart: "no"
+    # Bypass docker-entrypoint.sh (which would also start Uvicorn) and run Alembic directly.
+    entrypoint: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *app_environment
+

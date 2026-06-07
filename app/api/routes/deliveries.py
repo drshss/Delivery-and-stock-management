@@ -1,4 +1,4 @@
-"""Delivery-run workflow: create (with orders), list/filter, assign/re-assign, add order, cancel."""
+"""Delivery-run workflow: create (attach orders by id), list/filter, assign/re-assign, add order, cancel."""
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, selectinload
 
@@ -10,6 +10,7 @@ from app.models.delivery import (
     Delivery,
     DeliveryAssignmentHistory,
     Order,
+    OrderAssignmentHistory,
     OrderItem,
 )
 from app.models.enums import DeliveryStatus, UserRole
@@ -61,7 +62,7 @@ def _build_order(db: Session, payload: OrderCreate, delivery: Delivery) -> Order
             )
 
     order = Order(
-        order_number=generate_order_number(),
+        order_number=generate_order_number(db),
         customer_id=payload.customer_id,
         branch_id=payload.branch_id,
         notes=payload.notes,
@@ -84,25 +85,71 @@ def create_delivery(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin_or_manager),
 ):
-    """Create a delivery run (vehicle + agent + date) covering one or more customer orders."""
+    """Create a delivery run (vehicle + agent + date) and attach existing orders by id.
+
+    Order-first: orders are created beforehand (`POST /orders` or
+    `POST /orders/import`) and live in the pending pool until attached here (or via
+    `POST /orders/{id}/assign`). Pass an empty `order_ids` to create an empty run.
+    Only orders that have not started (pending/assigned) can be attached; an order
+    already on another open run is moved here and its previous run is rolled up.
+    """
     if payload.vehicle_id is not None and not db.get(Vehicle, payload.vehicle_id):
         raise HTTPException(status_code=400, detail="Vehicle not found")
     if payload.delivery_agent_id is not None:
         _validate_agent(db, payload.delivery_agent_id)
 
     delivery = Delivery(
-        delivery_number=generate_delivery_number(),
+        delivery_number=generate_delivery_number(db),
         vehicle_id=payload.vehicle_id,
         delivery_agent_id=payload.delivery_agent_id,
         scheduled_date=payload.scheduled_date,
         notes=payload.notes,
         created_by=current_user.id,
     )
-    for order_payload in payload.orders:
-        delivery.orders.append(_build_order(db, order_payload, delivery))
+    db.add(delivery)
+    db.flush()  # assign delivery.id for the FK + assignment history below
+
+    # De-duplicate ids while preserving the caller's order.
+    order_ids = list(dict.fromkeys(payload.order_ids))
+    source_run_ids: set[int] = set()
+    for order_id in order_ids:
+        order = db.get(Order, order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+        if order.status not in (DeliveryStatus.PENDING, DeliveryStatus.ASSIGNED):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Order {order_id} has started or is closed and cannot be assigned",
+            )
+
+        previous_delivery_id = order.delivery_id
+        if previous_delivery_id is not None:
+            source_run_ids.add(previous_delivery_id)
+
+        order.status = order_status_for_delivery(delivery)
+        delivery.orders.append(order)  # sets order.delivery_id; moves it off any prior run
+
+        db.add(
+            OrderAssignmentHistory(
+                order_id=order.id,
+                previous_delivery_id=previous_delivery_id,
+                new_delivery_id=delivery.id,
+                reason="Assigned on delivery creation",
+                changed_by=current_user.id,
+            )
+        )
+
+    db.flush()
+    # Roll up the status of any runs these orders were pulled away from.
+    for run_id in source_run_ids:
+        if run_id == delivery.id:
+            continue
+        source = db.get(Delivery, run_id)
+        if source is not None:
+            db.refresh(source)
+            recompute_delivery_status(source)
 
     recompute_delivery_status(delivery)
-    db.add(delivery)
     db.commit()
     db.refresh(delivery)
     return delivery

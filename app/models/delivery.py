@@ -49,7 +49,10 @@ class Delivery(Base):
     orders = relationship(
         "Order",
         back_populates="delivery",
-        cascade="all, delete-orphan",
+        # NOTE: intentionally NOT "delete-orphan". In the order-first model an order
+        # outlives its run: un-assigning (delivery_id -> NULL) or cancelling a run must
+        # return the order to the pending pool, never delete it.
+        cascade="save-update, merge",
         foreign_keys="Order.delivery_id",
     )
     assignment_history = relationship(
@@ -64,7 +67,9 @@ class Order(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     order_number: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
-    delivery_id: Mapped[int] = mapped_column(ForeignKey("deliveries.id"), nullable=False, index=True)
+    # Nullable: in the order-first model an order exists on its own (status PENDING)
+    # and is later assigned to a delivery run. NULL means "not yet scheduled".
+    delivery_id: Mapped[int | None] = mapped_column(ForeignKey("deliveries.id"), nullable=True, index=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"), nullable=False, index=True)
     branch_id: Mapped[int | None] = mapped_column(ForeignKey("customer_branches.id"), nullable=True, index=True)
     status: Mapped[DeliveryStatus] = mapped_column(

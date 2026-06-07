@@ -72,12 +72,25 @@ class OrderMove(BaseModel):
     reason: str | None = None
 
 
+class OrderAssign(BaseModel):
+    """Assign (or re-assign) a standalone/pending order to a delivery run."""
+
+    delivery_id: int
+    reason: str | None = None
+
+
+class OrderUnassign(BaseModel):
+    """Return an order to the pending pool (detach it from its delivery run)."""
+
+    reason: str | None = None
+
+
 class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     order_number: str
-    delivery_id: int
+    delivery_id: int | None = None
     customer_id: int
     branch_id: int | None = None
     status: DeliveryStatus
@@ -91,15 +104,46 @@ class OrderOut(BaseModel):
     evidences: list[OrderEvidenceOut] = []
 
 
+# ----- bulk order import (CSV) -----
+class OrderImportError(BaseModel):
+    """A single row/group that failed validation during a bulk import."""
+
+    row: int | None = None
+    order_ref: str | None = None
+    error: str
+
+
+class OrderImportResult(BaseModel):
+    """Outcome of a bulk CSV import.
+
+    When `committed` is False either it was a dry-run or validation failed, so no
+    orders were persisted (the import is all-or-nothing).
+    """
+
+    committed: bool
+    dry_run: bool
+    total_rows: int
+    orders_parsed: int
+    orders_created: int
+    created_order_numbers: list[str] = []
+    errors: list[OrderImportError] = []
+
+
 # ----- deliveries (runs) -----
 class DeliveryCreate(BaseModel):
-    """A delivery run: a vehicle + agent on a date, with one or more customer orders."""
+    """A delivery run: a vehicle + agent on a date.
+
+    Order-first: orders are created beforehand (`POST /orders` or
+    `POST /orders/import`) and live in the pending pool. Attach them to the run by
+    id via `order_ids`. Pass an empty list to create an empty run and assign orders
+    later through `POST /orders/{id}/assign`.
+    """
 
     scheduled_date: date
     vehicle_id: int | None = None
     delivery_agent_id: int | None = None
     notes: str | None = None
-    orders: list[OrderCreate] = Field(min_length=1)
+    order_ids: list[int] = Field(default_factory=list)
 
 
 class DeliveryAssign(BaseModel):

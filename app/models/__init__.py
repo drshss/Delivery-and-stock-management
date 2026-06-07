@@ -9,6 +9,7 @@ from app.models.delivery import (
     OrderEvidence,
     OrderItem,
 )
+from app.models.sequence import NumberSequence
 from app.models.stock import Stock, StockTransaction
 from app.models.user import User
 from app.models.vehicle import Vehicle
@@ -27,4 +28,5 @@ __all__ = [
     "OrderEvidence",
     "DeliveryAssignmentHistory",
     "OrderAssignmentHistory",
+    "NumberSequence",
 ]
