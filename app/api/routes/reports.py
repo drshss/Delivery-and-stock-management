@@ -96,6 +96,9 @@ def by_customer_report(
             func.coalesce(
                 func.sum(case((Order.status == DeliveryStatus.COMPLETED, 1), else_=0)), 0
             ).label("completed"),
+            func.coalesce(
+                func.sum(case((Order.status == DeliveryStatus.CANCELLED, 1), else_=0)), 0
+            ).label("cancelled"),
         )
         .join(Order, Order.customer_id == Customer.id)
         .join(Delivery, Order.delivery_id == Delivery.id)
@@ -131,13 +134,15 @@ def by_customer_report(
     for row in order_query.all():
         full, empty = item_map.get(row.customer_id, (0, 0))
         completed = int(row.completed)
+        cancelled = int(row.cancelled)
         results.append(
             CustomerDeliveryReport(
                 customer_id=row.customer_id,
                 customer_name=row.customer_name,
                 total_deliveries=row.total,
                 completed=completed,
-                pending=row.total - completed,
+                pending=row.total - completed - cancelled,
+                cancelled=cancelled,
                 total_full_delivered=full,
                 total_empty_collected=empty,
             )

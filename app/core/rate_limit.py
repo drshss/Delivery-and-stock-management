@@ -56,13 +56,11 @@ login_rate_limiter = _LoginRateLimiter(
 
 
 def get_client_ip(request: Request) -> str:
-    """Best-effort client IP. Honours X-Forwarded-For set by a trusted proxy.
+    """Best-effort client IP for rate limiting.
 
-    Uvicorn is started with --proxy-headers, so request.client.host already
-    reflects the forwarded client when behind a load balancer; we still check
-    the header explicitly as a fallback.
+    We intentionally trust only ``request.client.host`` (which Uvicorn populates
+    from ``X-Forwarded-For`` only when the immediate sender is in
+    ``--forwarded-allow-ips``). Reading raw forwarding headers here would bypass
+    that trust boundary and allow client-controlled spoofing.
     """
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"

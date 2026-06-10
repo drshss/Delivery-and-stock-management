@@ -1,9 +1,18 @@
 from datetime import date, datetime
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from app.core.config import settings
 from app.models.enums import DeliveryStatus
+
+
+def _normalize_invoice_number(value: str | None) -> str | None:
+    """Trim surrounding whitespace and treat a blank string as 'no invoice'."""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
 
 
 # ----- order items -----
@@ -54,7 +63,28 @@ class OrderCreate(BaseModel):
     customer_id: int
     branch_id: int | None = None
     notes: str | None = None
+    # Optional billing reference, set by an admin / stock manager at creation time.
+    invoice_number: str | None = Field(default=None, max_length=100)
     items: list[OrderItemCreate] = Field(min_length=1)
+
+    @field_validator("invoice_number")
+    @classmethod
+    def _clean_invoice_number(cls, v: str | None) -> str | None:
+        return _normalize_invoice_number(v)
+
+
+class OrderUpdate(BaseModel):
+    """Patch editable order metadata. Only fields that are present are applied,
+    so an admin / stock manager can attach (or clear) the invoice number after
+    the order has been created without touching anything else."""
+
+    invoice_number: str | None = Field(default=None, max_length=100)
+
+    @field_validator("invoice_number")
+    @classmethod
+    def _clean_invoice_number(cls, v: str | None) -> str | None:
+        return _normalize_invoice_number(v)
+
 
 
 class OrderComplete(BaseModel):
@@ -96,6 +126,7 @@ class OrderOut(BaseModel):
     status: DeliveryStatus
     completed_at: datetime | None = None
     notes: str | None = None
+    invoice_number: str | None = None
     evidence_override_reason: str | None = None
     evidence_overridden_by: int | None = None
     evidence_overridden_at: datetime | None = None

@@ -6,17 +6,14 @@ download, completion (with automatic stock update) and reporting.
 
 Run with:  python -m tests.smoke_test
 """
+from __future__ import annotations
+
 import os
 from datetime import date, timedelta
+from typing import TYPE_CHECKING
 
-# Point the app at a throwaway database BEFORE importing it.
-os.environ["DATABASE_URL"] = "sqlite:///./_smoke_test.db"
-
-from fastapi.testclient import TestClient  # noqa: E402
-
-from app.main import app  # noqa: E402
-from app.core.config import settings  # noqa: E402
-from app.manage import reset_admin_password  # noqa: E402
+if TYPE_CHECKING:  # for type checkers only; the real import is deferred into run()
+    from fastapi.testclient import TestClient
 
 
 def _auth(token: str) -> dict:
@@ -44,6 +41,18 @@ def _create_orders(client: TestClient, headers: dict, specs: list[dict]) -> list
 
 
 def run() -> None:
+    # Point the app at a throwaway database WITHOUT clobbering an explicit
+    # DATABASE_URL from the environment (setdefault, not assignment). The app
+    # imports are deferred into this function so that merely importing this
+    # module — e.g. during pytest collection of *_test.py files — has zero side
+    # effects: no env mutation and no database engine creation.
+    os.environ.setdefault("DATABASE_URL", "sqlite:///./_smoke_test.db")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import settings
+    from app.manage import reset_admin_password
+
     with TestClient(app) as client:
         # ---- health ----
         assert client.get("/health").json() == {"status": "ok"}
@@ -489,6 +498,71 @@ def run() -> None:
         # ---- RBAC: agent cannot onboard customers ----
         res = client.post("/api/v1/customers", headers=agent, json={"code": "X", "name": "Nope"})
         assert res.status_code == 403, "delivery agent must not be allowed to create customers"
+
+        # ===== Optional invoice number on orders (admin / stock manager) =====
+        # Set at creation time...
+        res = client.post(
+            "/api/v1/orders",
+            headers=manager,
+            json={
+                "customer_id": customer_id,
+                "branch_id": branch_id,
+                "invoice_number": "  INV-2026-001  ",  # surrounding whitespace is trimmed
+                "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 3}],
+            },
+        )
+        assert res.status_code == 201, res.text
+        inv_order = res.json()
+        inv_order_id = inv_order["id"]
+        assert inv_order["invoice_number"] == "INV-2026-001", inv_order
+
+        # ...and it round-trips on GET.
+        res = client.get(f"/api/v1/orders/{inv_order_id}", headers=admin)
+        assert res.status_code == 200 and res.json()["invoice_number"] == "INV-2026-001", res.text
+
+        # An order created without one has a null invoice_number.
+        res = client.post(
+            "/api/v1/orders",
+            headers=manager,
+            json={
+                "customer_id": customer_id,
+                "items": [{"cylinder_type_id": cyl_id, "quantity_ordered": 1}],
+            },
+        )
+        assert res.status_code == 201 and res.json()["invoice_number"] is None, res.text
+        plain_order_id = res.json()["id"]
+
+        # Attach an invoice AFTER creation via PATCH (admin / stock manager).
+        res = client.patch(
+            f"/api/v1/orders/{plain_order_id}",
+            headers=manager,
+            json={"invoice_number": "INV-2026-002"},
+        )
+        assert res.status_code == 200 and res.json()["invoice_number"] == "INV-2026-002", res.text
+
+        # An invoice can be attached even after the order is completed (order A).
+        res = client.patch(
+            f"/api/v1/orders/{order_a_id}",
+            headers=admin,
+            json={"invoice_number": "INV-2026-A"},
+        )
+        assert res.status_code == 200 and res.json()["invoice_number"] == "INV-2026-A", res.text
+
+        # Sending an empty string clears the invoice number back to null.
+        res = client.patch(
+            f"/api/v1/orders/{plain_order_id}",
+            headers=manager,
+            json={"invoice_number": "  "},
+        )
+        assert res.status_code == 200 and res.json()["invoice_number"] is None, res.text
+
+        # RBAC: a delivery agent cannot edit the invoice number.
+        res = client.patch(
+            f"/api/v1/orders/{inv_order_id}",
+            headers=agent,
+            json={"invoice_number": "HACK"},
+        )
+        assert res.status_code == 403, "delivery agent must not be able to set an invoice number"
 
         # ===== Q4: refresh tokens + logout (revocation) =====
         res = client.post(

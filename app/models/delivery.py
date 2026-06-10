@@ -80,6 +80,9 @@ class Order(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Optional billing reference (e.g. the Zoho invoice number) attached by an
+    # admin or stock manager, either at creation time or later once it's issued.
+    invoice_number: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     # Audit trail for an admin completing an order without the mandatory photo evidence.
     evidence_override_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     evidence_overridden_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)

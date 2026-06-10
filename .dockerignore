@@ -10,13 +10,21 @@ env
 .env.*
 !.env.example
 creds
+secrets.*
 *.pem
 *.key
 
-# Local databases & uploads (must not be baked into images)
+# Local databases, backups & uploads (must not be baked into images)
 *.db
 *.sqlite
 *.sqlite3
+# SQLite sidecar files (write-ahead log / shared memory)
+*.db-shm
+*.db-wal
+*.db-*
+# Timestamped DB backups (e.g. delivery_app.db.bak-20260607-015003)
+*.db.bak-*
+*.bak
 uploads/
 _smoke_uploads/
 

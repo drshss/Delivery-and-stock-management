@@ -1,4 +1,6 @@
 """Delivery-run workflow: create (attach orders by id), list/filter, assign/re-assign, add order, cancel."""
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, selectinload
 
@@ -66,6 +68,7 @@ def _build_order(db: Session, payload: OrderCreate, delivery: Delivery) -> Order
         customer_id=payload.customer_id,
         branch_id=payload.branch_id,
         notes=payload.notes,
+        invoice_number=payload.invoice_number,
         status=order_status_for_delivery(delivery),
     )
     for item in payload.items:
@@ -189,12 +192,13 @@ def list_deliveries(
     vehicle_id: int | None = None,
     agent_id: int | None = None,
     customer_id: int | None = None,
-    scheduled_date: str | None = None,
+    scheduled_date: date | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """List delivery runs. Filter by status, vehicle, agent, customer or date.
 
+    `scheduled_date` accepts an ISO date (YYYY-MM-DD); invalid input is rejected.
     Delivery agents only ever see runs assigned to themselves.
     """
     query = db.query(Delivery).options(

@@ -20,6 +20,7 @@ class CustomerDeliveryReport(BaseModel):
     total_deliveries: int
     completed: int
     pending: int
+    cancelled: int
     total_full_delivered: int
     total_empty_collected: int
 

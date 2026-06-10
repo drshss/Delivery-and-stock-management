@@ -1,6 +1,8 @@
 """Order workflow: order-first create & bulk import, list/filter, detail, evidence
 upload, assign/unassign to a run, completion (stock update), cancel, move."""
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import date, datetime, timezone
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy.orm import Session, selectinload
@@ -30,6 +32,7 @@ from app.schemas.delivery import (
     OrderMove,
     OrderOut,
     OrderUnassign,
+    OrderUpdate,
 )
 from app.services.delivery import (
     generate_order_number,
@@ -85,6 +88,7 @@ def _build_unassigned_order(db: Session, payload: OrderCreate) -> Order:
         customer_id=payload.customer_id,
         branch_id=payload.branch_id,
         notes=payload.notes,
+        invoice_number=payload.invoice_number,
         status=DeliveryStatus.PENDING,
     )
     for item in payload.items:
@@ -104,13 +108,14 @@ def list_orders(
     unassigned: bool | None = None,
     vehicle_id: int | None = None,
     agent_id: int | None = None,
-    scheduled_date: str | None = None,
+    scheduled_date: date | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """List orders. Filter by status, customer, branch, delivery, vehicle, agent or date.
 
     Pass `unassigned=true` to see the pending pool (orders not yet on any run).
+    `scheduled_date` accepts an ISO date (YYYY-MM-DD); invalid input is rejected.
     Delivery agents only ever see orders within runs assigned to themselves.
     """
     query = db.query(Order).options(
@@ -250,6 +255,33 @@ def get_order(
     return order
 
 
+# ----------------------------- Update order metadata (per order) -----------------------------
+@router.patch(
+    "/{order_id}",
+    response_model=OrderOut,
+    summary="Update order metadata (e.g. attach/clear the invoice number) — admin / stock manager",
+)
+def update_order(
+    order_id: int,
+    payload: OrderUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin_or_manager),
+):
+    """Patch editable order metadata. Currently the invoice number, which an admin
+    or stock manager can attach once it's issued (or clear by sending null/empty).
+    Only fields present in the request body are touched; everything else is left
+    as-is, and the order's delivery lifecycle/status is unaffected."""
+    order = _get_order_or_404(db, order_id)
+
+    data = payload.model_dump(exclude_unset=True)
+    if "invoice_number" in data:
+        order.invoice_number = data["invoice_number"]
+
+    db.commit()
+    db.refresh(order)
+    return order
+
+
 # ----------------------------- Evidence upload (per order) -----------------------------
 @router.post(
     "/{order_id}/evidence",
@@ -325,11 +357,27 @@ def download_order_evidence(
     if not evidence or evidence.order_id != order.id:
         raise HTTPException(status_code=404, detail="Evidence not found")
 
-    safe_name = (evidence.filename or f"evidence-{evidence.id}").replace('"', "")
+    # Build a safe Content-Disposition. The filename is user-supplied, so strip
+    # control characters (CR/LF etc.) to prevent header injection / response
+    # splitting, and drop quotes/backslashes that would break the quoted-string.
+    # An RFC 5987 `filename*` carries the full UTF-8 name for modern clients,
+    # with a sanitized ASCII `filename` fallback for older ones.
+    raw_name = evidence.filename or f"evidence-{evidence.id}"
+    ascii_name = (
+        "".join(c for c in raw_name if c.isprintable() and c not in '"\\')
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .strip()
+    ) or f"evidence-{evidence.id}"
+    utf8_name = quote(raw_name, safe="")
     return Response(
         content=evidence.data,
         media_type=evidence.content_type,
-        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+        headers={
+            "Content-Disposition": (
+                f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'
+            )
+        },
     )
 
 
@@ -381,19 +429,46 @@ def complete_order(
         order.evidence_overridden_by = current_user.id
         order.evidence_overridden_at = datetime.now(timezone.utc)
 
-    items_by_type = {item.cylinder_type_id: item for item in order.items}
-    for completed in payload.items:
-        item = items_by_type.get(completed.cylinder_type_id)
-        if not item:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cylinder type {completed.cylinder_type_id} is not part of this order",
-            )
-        item.quantity_delivered = completed.quantity_delivered
-        item.quantity_empty_collected = completed.quantity_empty_collected
+    # Validate the completion payload up front, before mutating anything: it must
+    # contain exactly one entry per cylinder type on the order — no missing lines,
+    # no duplicates, no extras. A partial payload would leave omitted lines at their
+    # previous (usually zero) quantities while still flipping the order to COMPLETED,
+    # and a duplicated line would double-count stock movements — either way silently
+    # corrupting completion, stock and reporting data.
+    order_type_ids = {item.cylinder_type_id for item in order.items}
+    counts = Counter(completed.cylinder_type_id for completed in payload.items)
 
-        # Row-lock the stock record so concurrent completions can't corrupt counts
-        # (FOR UPDATE on PostgreSQL; ignored harmlessly on SQLite).
+    duplicates = sorted(tid for tid, n in counts.items() if n > 1)
+    if duplicates:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Completion payload has duplicate entries for cylinder type(s): {duplicates}",
+        )
+    unknown = sorted(set(counts) - order_type_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cylinder type(s) {unknown} are not part of this order",
+        )
+    missing = sorted(order_type_ids - set(counts))
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Completion payload is missing cylinder type(s): {missing}",
+        )
+
+    items_by_type = {item.cylinder_type_id: item for item in order.items}
+
+    # Pre-flight: lock every affected stock row and verify the completion won't
+    # drive full stock negative BEFORE mutating anything. Delivered full cylinders
+    # are subtracted from on-hand stock, so an over-delivery (or stale/short stock)
+    # would otherwise push full_quantity below zero and corrupt stock summaries and
+    # later release/adjust validations. Row-locking here (FOR UPDATE on PostgreSQL;
+    # ignored harmlessly on SQLite) also stops concurrent completions from racing
+    # the same counts; the locks are held until commit/rollback below.
+    stock_by_type: dict[int, Stock] = {}
+    shortfalls: list[str] = []
+    for completed in payload.items:
         stock = (
             db.query(Stock)
             .filter(Stock.cylinder_type_id == completed.cylinder_type_id)
@@ -404,6 +479,25 @@ def complete_order(
             stock = Stock(cylinder_type_id=completed.cylinder_type_id, full_quantity=0, empty_quantity=0)
             db.add(stock)
             db.flush()
+        if stock.full_quantity < completed.quantity_delivered:
+            shortfalls.append(
+                f"cylinder type {completed.cylinder_type_id} "
+                f"(have {stock.full_quantity}, need {completed.quantity_delivered})"
+            )
+        stock_by_type[completed.cylinder_type_id] = stock
+
+    if shortfalls:
+        raise HTTPException(
+            status_code=400,
+            detail="Insufficient full stock to complete this order: " + "; ".join(shortfalls),
+        )
+
+    for completed in payload.items:
+        item = items_by_type[completed.cylinder_type_id]
+        item.quantity_delivered = completed.quantity_delivered
+        item.quantity_empty_collected = completed.quantity_empty_collected
+
+        stock = stock_by_type[completed.cylinder_type_id]
         # Full cylinders leave the warehouse; empties come back in.
         stock.full_quantity -= completed.quantity_delivered
         stock.empty_quantity += completed.quantity_empty_collected
