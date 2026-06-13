@@ -12,8 +12,12 @@
 #   3. Deploy/scale the app:  docker compose up -d --build
 services:
   api:
-    build: .
+    image: adarshss/delivery-app:1.1.0
     restart: unless-stopped
+    # Load the FULL .env into the container so DATABASE_URL (and everything else)
+    # actually reaches the app. Without this the app falls back to its built-in
+    # defaults — notably sqlite:///./delivery_app.db instead of your Postgres.
+    env_file: .env
     environment: &app_environment
       ENVIRONMENT: ${ENVIRONMENT:-production}
       SECRET_KEY: ${SECRET_KEY}
@@ -34,11 +38,12 @@ services:
   # Reuses the API image and the exact same environment (the production-safety
   # checks in config.py require SECRET_KEY/DATABASE_URL/etc. even just to migrate).
   migrate:
-    build: .
+    image: adarshss/delivery-app:1.1.0
     profiles: ["tools"]
     restart: "no"
     # Bypass docker-entrypoint.sh (which would also start Uvicorn) and run Alembic directly.
     entrypoint: ["alembic", "upgrade", "head"]
+    env_file: .env
     environment:
       <<: *app_environment
 

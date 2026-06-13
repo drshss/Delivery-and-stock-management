@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import IntegrityError
 
 from app import models  # noqa: F401  (ensures all models are registered)
 from app.api.routes import (
@@ -52,21 +53,34 @@ if settings.SENTRY_DSN:
 
 
 def _create_first_admin() -> None:
-    """Create the bootstrap admin account if it does not exist yet."""
+    """Create the bootstrap admin account if it does not exist yet.
+
+    Idempotent and concurrency-safe. With multiple Uvicorn workers this runs once
+    per worker process, so they can race to insert the same email on a fresh DB.
+    The UNIQUE(email) constraint lets exactly one win; the losers catch the
+    IntegrityError and roll back instead of crashing the whole app on startup.
+    """
     db = SessionLocal()
     try:
         exists = db.query(User).filter(User.email == settings.FIRST_ADMIN_EMAIL).first()
-        if not exists:
-            db.add(
-                User(
-                    full_name=settings.FIRST_ADMIN_NAME,
-                    email=settings.FIRST_ADMIN_EMAIL,
-                    role=UserRole.ADMIN,
-                    hashed_password=hash_password(settings.FIRST_ADMIN_PASSWORD),
-                    is_active=True,
-                )
+        if exists:
+            return
+        db.add(
+            User(
+                full_name=settings.FIRST_ADMIN_NAME,
+                email=settings.FIRST_ADMIN_EMAIL,
+                role=UserRole.ADMIN,
+                hashed_password=hash_password(settings.FIRST_ADMIN_PASSWORD),
+                is_active=True,
             )
-            db.commit()
+        )
+        db.commit()
+        logger.info("Bootstrap admin %s created", settings.FIRST_ADMIN_EMAIL)
+    except IntegrityError:
+        # Another worker won the race and created the admin first — expected on a
+        # fresh database under multiple workers; not an error.
+        db.rollback()
+        logger.info("Bootstrap admin already exists (created concurrently); skipping")
     finally:
         db.close()
 
